@@ -1,0 +1,11 @@
+name: strangefish
+channels:
+  - defaults
+dependencies:
+  - numpy
+  - pip
+  - python
+  - tqdm
+  - pip:
+    - click
+    - reconchess

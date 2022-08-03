@@ -1,0 +1,17 @@
+/*.json
+.pytest_cache
+.idea
+*.pyc
+output_file
+/tempbots/
+*.log
+.venv
+.ipynb_checkpoints
+stockfish-*
+*.csv
+*.txt
+gameLogs/
+test_cases
+score_cache.*
+*.prof
+endgame_tables/

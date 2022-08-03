@@ -808,7 +808,7 @@ class StrangeFish2(StrangeFish):
 
         # Otherwise, calculate move scores for a random board that could be reached in two turns
         elif self.while_we_wait_extension:
-            board = random.choice(tuple(self.next_turn_boards_unsorted))
+            board = random.choice(tuple(self.next_turn_boards_unsorted)).copy(stack=False)
             board.push(random.choice(list(generate_rbc_moves(board))))
             board.push(random.choice(list(generate_rbc_moves(board))))
             if board.king(chess.WHITE) is not None and board.king(chess.BLACK) is not None:

@@ -136,7 +136,7 @@ def accept_invitation_and_play(server_url, auth, invitation_id, finished):
     # make sure this process doesn't react to the first interrupt signal
     signal.signal(signal.SIGINT, ignore_one_term)
 
-    player = StrangeFish2()
+    player = StrangeFish2(rc_disable_pbar=True)
 
     logger = create_sub_logger("invitations")
 

@@ -69,7 +69,9 @@ class StrangeFish(Player):
         """
         Set up the MHT core of StrangeFish.
 
-        :param log_to_file: A boolean flag to turn on/off logging to file gameLogs/<date code>.log
+        :param log_to_file: A boolean flag to turn on/off logging to file game_logs/game_<game_id>.log
+        :param stream_log_level: Logging level of detail to print to the screen
+        :param game_id: Any printable identifier for logging (typically, the game number given by the server)
         :param rc_disable_pbar: A boolean flag to turn on/off the tqdm progress bars
         """
 

@@ -116,7 +116,8 @@ def make_cache_key(board: chess.Board, move: chess.Move = PASS, prev_turn_score:
 
 class StrangeFish2(StrangeFish):
     """
-    The reconchess agent, StrangeFish2, that took second place in the NeurIPS 2021 tournament of RBC.
+    The reconchess agent, StrangeFish2, that won the NeurIPS 2022 tournament of RBC
+    (and took second place in the NeurIPS 2021 tournament).
 
     StrangeFish2 is, clearly, an extension of the 2019 tournament winner, StrangeFish. Each tracks an exhaustive set of
     possible board states and chooses sense and move actions based on analysis of the scores assigned to each
@@ -124,7 +125,7 @@ class StrangeFish2(StrangeFish):
     series of uncertainty-related heuristics.
 
     Moves are chosen to maximize the expected outcome of the current turn. This computation is configurable in
-    MoveConfig; for the 2021 tournament, I used 70% average + 30% minimum score to evaluate move options.
+    MoveConfig; I used 70% average + 30% minimum score to evaluate move options.
 
     The primary difference between StrangeFish2 and its predecessor, StrangeFish, is the sense strategy. StrangeFish2
     chooses where to sense to maximize a hybrid objective that is primarily the same objective as the move strategy:
@@ -138,12 +139,20 @@ class StrangeFish2(StrangeFish):
     at https://github.com/ginop/reconchess-strangefish). This framework is much more efficient, and bots previously
     based on StrangeFish would benefit from being ported over.
 
+    Between the 2021 and 2022 tournaments, StrangeFish2 was partially rewritten to improve speed and strategy. The
+    most impactful strategic change was the revised sampling strategy for evaluating move options. Previously, one
+    possible board state was sampled, and each move option was evaluated for that board. This wasted a lot of time
+    evaluating moves that were not under consideration, so the updated method samples a move similar to UCT (highest
+    score plus bonus for under-visited options) and then samples a board for which that move has not been evaluated.
+    This spends more time evaluating moves that might be selected, which greatly reduced the occurrence of moves
+    selected without being evaluated on the true board. Additionally, the 2022 code has a module to store possible
+    boards for later consideration, permitting fast operation even when the board set size grows large. Optionally,
+    the opening turns can be simplified by providing a precomputed cache of board+move evaluations and/or a set of
+    opening books.
+
     To run StrangeFish2, you'll need to download the chess engine Stockfish from https://stockfishchess.org/download/
     and create an environment variable called STOCKFISH_EXECUTABLE that is the path to the downloaded Stockfish
-    executable. Recent versions of Stockfish use a neural network for evaluation, which improves performance over the
-    strictly rules-based prior versions, but seems to cause odd behavior when passed board states that are possible in
-    RBC but not in chess. Or maybe it's unrelated to the network; either way, StrangeFish2 is only stable with versions
-    up to Stockfish 11.
+    executable.
     """
 
     def __init__(
@@ -169,8 +178,12 @@ class StrangeFish2(StrangeFish):
         """
         Constructs an instance of the StrangeFish2 agent.
 
-        :param log_to_file: A boolean flag to turn on/off logging to file gameLogs/<date code>.log
+        :param log_to_file: A boolean flag to turn on/off logging to file game_logs/game_<game_id>.log
+        :param game_id: Any printable identifier for logging (typically, the game number given by the server)
         :param rc_disable_pbar: A boolean flag to turn on/off the tqdm progress bars
+
+        :param load_score_cache: A boolean flag to turn on/off pre-computed score cache
+        :param load_opening_book: A boolean flag to turn on/off pre-computed opening book
 
         :param sense_config: A dataclass of parameters which determine the sense strategy's score calculation
         :param move_config: A dataclass of parameters which determine the move strategy's score calculation
@@ -388,7 +401,7 @@ class StrangeFish2(StrangeFish):
         return None
 
     def last_ditch_plan(self):
-        self.logger.info('Time is running out! Switching to aggressive backup plan.')
+        self.logger.info("Time is running out! Switching to aggressive backup plan.")
 
         self.sense_config.expected_outcome_coef = 1.0
         self.sense_config.worst_outcome_coef = 0.0
@@ -774,9 +787,8 @@ class StrangeFish2(StrangeFish):
         true state by an estimate of the opponent's position's strength. Each move is scored on each board, and the
         resulting scores are assessed together by looking at the worst-case score, the average score, and the best-case
         score. The relative contributions of these components to the compound score are determined by a config object.
-        If requested by the config, bonus points are awarded to moves based on the expected number of boards removed
-        from the possible set by attempting that move. Deterministic move patterns are reduced by randomly choosing a
-        move that is within a few percent of the maximum score.
+        Deterministic move patterns are reduced by randomly choosing a move that is within a configurable range of the
+        maximum score.
         """
 
         if self.opening_book is not None:
@@ -951,12 +963,14 @@ class StrangeFish2(StrangeFish):
 
         self.logger.debug("Move values presented as: (min, mean, max, compound) @ samples")
         for move, est in move_scores.items():
-            self.logger.debug(f"{move.uci()}: ("
-                              f"{est.minimum:5.0f}, "
-                              f"{est.average:5.0f}, "
-                              f"{est.maximum: 5.0f}, "
-                              f"{compound_score[move]: 5.0f})"
-                              f" @ {est.num_samples}")
+            self.logger.debug(
+                f"{move.uci()}: ("
+                f"{est.minimum:5.0f}, "
+                f"{est.average:5.0f}, "
+                f"{est.maximum: 5.0f}, "
+                f"{compound_score[move]: 5.0f})"
+                f" @ {est.num_samples}"
+            )
 
         # Create a list of all moves which scored above the threshold
         move_options = [move for move, score in compound_score.items() if score >= threshold_score]

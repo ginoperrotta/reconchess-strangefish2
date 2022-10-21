@@ -22,22 +22,29 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     Original copyright (c) 2019, Gino Perrotta, Robert Perrotta, Taylor Myers
 """
 
+import logging
+import os
 from collections import defaultdict
 from functools import partial
 from time import time, sleep
-from typing import Optional, List, Tuple, Set
+from tqdm import tqdm
+from typing import Optional, List, Tuple, Set, Dict
 
 import chess.engine
 from reconchess import Player, Color, GameHistory, WinReason, Square
-from tqdm import tqdm
 
-from strangefish.utilities import (
-    board_matches_sense,
-    update_board_by_move,
-    populate_next_board_set,
-)
-from strangefish.utilities.player_logging import create_main_logger
+from strangefish.utilities import board_matches_sense, update_board_by_move, populate_next_board_set, PASS
+from strangefish.utilities.board_set_backlog import BoardSetBacklog
+from strangefish.utilities.player_logging import create_file_handler, create_stream_handler
 from strangefish.utilities.timing import Timer
+
+# Parameters for minor bot behaviors
+RC_DISABLE_PBAR = os.getenv('RC_DISABLE_PBAR', 'false').lower() == 'true'  # Flag to disable the tqdm progress bars
+WAIT_LOOP_RATE_LIMIT = 2  # minimum seconds spent looping in self.while_we_wait()
+
+# Parameters for switching to the emergency backup plan
+BOARD_SET_LIMIT = 1_000  # number of boards in set at which we stop processing and store for later
+REPOPULATE_BOARD_SET_TARGET = 30  # number of boards at which we stop repopulating from stored states
 
 
 class StrangeFish(Player):
@@ -54,8 +61,10 @@ class StrangeFish(Player):
 
     def __init__(
         self,
-        log_to_file: bool,
-        rc_disable_pbar: bool,
+        log_to_file=True,
+        stream_log_level=logging.INFO,
+        game_id=None,
+        rc_disable_pbar=RC_DISABLE_PBAR,
     ):
         """
         Set up the MHT core of StrangeFish.
@@ -65,16 +74,26 @@ class StrangeFish(Player):
         """
 
         self.boards: Set[chess.Board] = set()
-        self.priority_boards: Set[chess.Board] = set()
-        self.next_turn_boards: defaultdict[Optional[Square], Set] = defaultdict(set)
+        self.board_sample_priority: Dict[int, Set[chess.Board]] = {}
+        self.next_turn_boards: defaultdict[Optional[chess.Square], Set[chess.Board]] = defaultdict(set)
         self.next_turn_boards_unsorted: Set[chess.Board] = set()
+        self.num_boards_at_end_of_turn = None
+        self.stored_old_boards = None
 
         self.color = None
         self.turn_num = None
+        self.projected_end_time = None
 
         self.rc_disable_pbar = rc_disable_pbar
 
-        self.logger = create_main_logger(log_to_file=log_to_file)
+        game_log = logging.getLogger(f"game-{game_id}")
+        game_log.setLevel(logging.DEBUG)
+        game_log.addHandler(create_stream_handler(stream_log_level))
+        if log_to_file:
+            game_log.addHandler(create_file_handler(f"game_{game_id}.log"))
+
+        self.logger = logging.getLogger(f"game-{game_id}.agent")
+        self.logger.setLevel(logging.DEBUG)
         self.logger.debug("A new StrangeFish player was initialized.")
 
     def handle_game_start(self, color: Color, board: chess.Board, opponent_name: str):
@@ -82,13 +101,16 @@ class StrangeFish(Player):
 
         self.logger.info(f"Starting a new game as {color_name} against {opponent_name}.")
         self.boards = {board}
-        self.priority_boards = set()
+        self.board_sample_priority = defaultdict(set)
+        self.stored_old_boards = BoardSetBacklog()
         self.color = color
         self.turn_num = 0
+        self.num_boards_at_end_of_turn = 1
+        self.projected_end_time = time() + 900
 
     def handle_opponent_move_result(self, captured_my_piece: bool, capture_square: Optional[Square]):
         self.turn_num += 1
-        self.logger.debug(f"Starting turn {self.turn_num}.")
+        self.logger.debug("Starting turn %d.", self.turn_num)
 
         # Do not "handle_opponent_move_result" if no one has moved yet
         if self.turn_num == 1 and self.color == chess.WHITE:
@@ -100,16 +122,20 @@ class StrangeFish(Player):
             self.logger.debug("Opponent's move was not a capture.")
 
         # If creation of new board set didn't complete during op's turn (self.boards will not be empty)
+        while self.boards and len(self.next_turn_boards[capture_square]) < BOARD_SET_LIMIT:
+            self.expand_one_board(required_op_capture_square=capture_square)
+
         if self.boards:
-            new_board_set, boards_in_check = populate_next_board_set(
-                self.boards, self.color, rc_disable_pbar=self.rc_disable_pbar
-            )
-            self.priority_boards |= boards_in_check
-            for square in new_board_set.keys():
-                self.next_turn_boards[square] |= new_board_set[square]
+            self.logger.debug(f"Board set has exceeded limit, storing {len(self.boards)} to process later.")
+            # will still have boards in set if expanded already to limit
+            self.stored_old_boards.add_row(self.boards)
+        num_boards_expanded = self.num_boards_at_end_of_turn - len(self.boards)
+        observed_ratio = max(1., len(self.next_turn_boards[capture_square])) / max(1., num_boards_expanded)
+        self.stored_old_boards.add_info("op_capture", capture_square, observed_ratio)
 
         # Get this turn's board set from a dictionary keyed by the possible capture squares
         self.boards = self.next_turn_boards[capture_square]
+        self.repopulate_exhausted_board_set()
 
         self.logger.debug(
             "Finished expanding and filtering the set of possible board states. "
@@ -130,7 +156,7 @@ class StrangeFish(Player):
         )
 
         # The option to pass isn't included in the reconchess input
-        move_actions += [chess.Move.null()]
+        move_actions += [PASS]
 
         with Timer(self.logger.debug, "choosing sense location"):
             # Pass the needed information to the decision-making function to choose a sense square
@@ -163,13 +189,18 @@ class StrangeFish(Player):
         }
         self.logger.debug(f"There were {num_before} possible boards before sensing " f"and {len(self.boards)} after.")
 
+        observed_ratio = max(1., len(self.boards)) / num_before
+        self.stored_old_boards.add_info("sense_result", sense_result, observed_ratio)
+        self.repopulate_exhausted_board_set()
+
     def choose_move(self, move_actions: List[chess.Move], seconds_left: float) -> Optional[chess.Move]:
+        self.projected_end_time = time() + seconds_left
 
         # Currently, move_actions is passed by reference, so if we add the null move here it will be in the list twice
         #  since we added it in choose_sense also. Instead of removing this line altogether, I'm leaving a check so we
         #  are prepared in the case that reconchess is updated to pass a copy of the move_actions list instead.
-        if chess.Move.null() not in move_actions:
-            move_actions += [chess.Move.null()]
+        if PASS not in move_actions:
+            move_actions += [PASS]
 
         self.logger.debug(
             f"Choosing move for turn {self.turn_num} "
@@ -184,7 +215,7 @@ class StrangeFish(Player):
         self.logger.debug(f"The chosen move was {move_choice}")
 
         # reconchess uses None for the null move, so correct the function output if that was our choice
-        return move_choice if move_choice != chess.Move.null() else None
+        return move_choice if move_choice != PASS else None
 
     def move_strategy(self, move_actions: List[chess.Move], seconds_left: float) -> Optional[chess.Move]:
         raise NotImplementedError
@@ -204,9 +235,9 @@ class StrangeFish(Player):
         num_boards_before_filtering = len(self.boards)
 
         if requested_move is None:
-            requested_move = chess.Move.null()
+            requested_move = PASS
         if taken_move is None:
-            taken_move = chess.Move.null()
+            taken_move = PASS
 
         # Filter the possible board set to only boards on which the requested move would have resulted in the taken move
         i = tqdm(
@@ -235,33 +266,91 @@ class StrangeFish(Player):
             f"before filtering and {len(self.boards)} after."
         )
 
+        observed_ratio = max(1., len(self.boards)) / num_boards_before_filtering
+        self.stored_old_boards.add_info("move_result", (requested_move, taken_move, capture_square), observed_ratio)
+
         # Re-initialize the set of boards for next turn (filled in while_we_wait and/or handle_opponent_move_result)
+        self.num_boards_at_end_of_turn = len(self.boards)
         self.next_turn_boards = defaultdict(set)
         self.next_turn_boards_unsorted = set()
-        self.priority_boards = set()
+        self.board_sample_priority = defaultdict(set)
+
+    def expand_one_board(
+            self,
+            required_op_capture_square: Optional[chess.Square] = False,
+    ):
+        if not self.boards:
+            return
+        new_board_set, board_sample_priority = populate_next_board_set(
+            {self.boards.pop()},
+            required_op_capture_square=required_op_capture_square,
+            rc_disable_pbar=True,
+        )
+        for priority, boards in board_sample_priority.items():
+            self.board_sample_priority[priority] |= boards
+        for square, boards in new_board_set.items():
+            self.next_turn_boards[square] |= boards
+            self.next_turn_boards_unsorted |= boards
+
+    def expand_one_old_board(self):
+        if self.stored_old_boards.is_empty:
+            return 0
+        new_boards, board_sample_priority = self.stored_old_boards.expand_one_old_board()
+        self.boards |= new_boards
+        for priority, boards in board_sample_priority.items():
+            self.board_sample_priority[priority] |= boards
+        return len(new_boards)
+
+    def repopulate_exhausted_board_set(self):
+        if self.stored_old_boards.is_empty:
+            return
+        for _boards, _steps in self.stored_old_boards.stored_boards_and_turns_since:
+            self.logger.debug(f"Currently have {_boards} boards stored from {_steps} turns ago.")
+        self.logger.debug(f"Estimate {self.stored_old_boards.total_stored_boards} stored old boards"
+                          f" would expand into {round(self.stored_old_boards.expected_size)} current boards.")
+        if len(self.boards) >= REPOPULATE_BOARD_SET_TARGET:
+            return
+        original_set_size = len(self.boards)
+        total = self.stored_old_boards.total_stored_boards
+        self.logger.debug(f"Repopulating exhausted board set from {total} stored boards")
+        with tqdm(total=total, desc="Repopulating exhausted board set", disable=self.rc_disable_pbar) as pbar:
+            prev_total = total
+            while not self.stored_old_boards.is_empty and len(self.boards) < REPOPULATE_BOARD_SET_TARGET:
+                self.expand_one_old_board()
+                new_total = self.stored_old_boards.total_stored_boards
+                pbar.update(n=prev_total - new_total)
+                prev_total = new_total
+                if time() > self.projected_end_time:
+                    self.logger.warning("Breaking board set construction due to time limit")
+                    break
+        self.logger.debug(f"Constructed {len(self.boards) - original_set_size} new boards from stored past states.")
+        for _boards, _steps in self.stored_old_boards.stored_boards_and_turns_since:
+            self.logger.debug(f"Currently have {_boards} boards stored from {_steps} turns ago.")
 
     def while_we_wait(self):
         start_time = time()
         self.logger.debug(
-            "Running the `while_we_wait` method. " f"{len(self.boards)} boards left to expand for next turn."
+            "Running the `while_we_wait` method. "
+            f"{len(self.boards)} boards left to expand for next turn."
         )
 
-        our_king_square = tuple(self.boards)[0].king(self.color) if len(self.boards) else None
+        logged_current_board_message = False
+        logged_old_board_message = False
 
-        while time() - start_time < 1:  # Rate-limit server queries by looping here for at least 1 second
+        while time() - start_time < WAIT_LOOP_RATE_LIMIT:
 
             # If there are still boards in the set from last turn, remove one and expand it by all possible moves
-            if len(self.boards):
-                new_board_set, priority_boards = populate_next_board_set(
-                    {self.boards.pop()},
-                    self.color,
-                    rc_disable_pbar=True,
-                )
-                self.priority_boards |= priority_boards
-                for square in new_board_set.keys():
-                    self.next_turn_boards[square] |= new_board_set[square]
-                    if square != our_king_square:
-                        self.next_turn_boards_unsorted |= new_board_set[square]
+            if self.boards:
+                if not logged_current_board_message:
+                    logged_current_board_message = True
+                    self.logger.debug("Expanding current boards for next turn's board set")
+                self.expand_one_board()
+            elif not self.stored_old_boards.is_empty:
+                if not logged_old_board_message:
+                    logged_old_board_message = True
+                    self.logger.debug("Expanding stored old boards for next turn's board set")
+                num_new_boards = self.expand_one_old_board()
+                self.num_boards_at_end_of_turn += num_new_boards
 
             # If all of last turn's boards have been expanded, pass to the sense/move function's waiting method
             else:

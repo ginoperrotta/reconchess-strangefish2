@@ -30,7 +30,7 @@ def main():
 
     winner_color, win_reason, game_history = play_local_game(
         TroutBot(),
-        StrangeFish2(),
+        StrangeFish2(game_id="EXAMPLE"),
     )
 
     window = ReplayWindow(game_history)

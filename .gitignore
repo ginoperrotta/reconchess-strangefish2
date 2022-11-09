@@ -5,6 +5,7 @@
 output_file
 /tempbots/
 *.log
+*.log.*
 .venv
 .ipynb_checkpoints
 stockfish-*

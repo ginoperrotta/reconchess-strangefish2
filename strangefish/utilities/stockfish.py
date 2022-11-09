@@ -20,4 +20,8 @@ if not os.path.exists(STOCKFISH_EXECUTABLE):
 
 def create_engine():
     engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_EXECUTABLE, setpgrp=True)
+    engine.configure({
+        'Hash': 2048,
+        'Threads': 3,
+    })
     return engine

@@ -1,9 +1,10 @@
 # StrangeFish2
 
 StrangeFish2 is a bot created to play Reconnaissance Blind Chess (RBC).
-It played in and placed second in the NeurIPS 2021 RBC tournament!
-For more information about RBC and the tournament, see
-https://rbc.jhuapl.edu/ and https://rbc.jhuapl.edu/tournaments/33.
+It won the NeurIPS 2022 RBC tournament
+and placed second in the NeurIPS 2021 RBC tournament!
+For more information about RBC and the tournaments, see
+https://rbc.jhuapl.edu/ and https://rbc.jhuapl.edu/past_competitions.
 
 StrangeFish2 is a continuation of the NeurIPS 2019 RBC tournament 
 winner, StrangeFish. https://github.com/ginop/reconchess-strangefish. 
@@ -70,7 +71,7 @@ export PYTHONPATH='.':$PYTHONPATH
 
 ## Local bot matches
 
-See `strangefish/utilities/example_game.py` 
+See `scripts/example_game.py` 
 to play a local RBC game using StrangeFish2.
 
 ## Server matches

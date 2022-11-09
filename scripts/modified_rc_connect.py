@@ -23,32 +23,30 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 import json
+from datetime import datetime
+import logging
 import multiprocessing
 import signal
 import sys
 import time
 import traceback
-
-import chess
 import click
 import requests
+
+import chess
 from reconchess import Player, RemoteGame, play_turn, ChessJSONDecoder, ChessJSONEncoder
-from reconchess.scripts.rc_connect import (
-    RBCServer,
-    ranked_mode,
-    unranked_mode,
-    check_package_version,
-)
+from reconchess.scripts.rc_connect import RBCServer, check_package_version
 
 from strangefish.strangefish_strategy import StrangeFish2
 from strangefish.utilities import ignore_one_term
-from strangefish.utilities.player_logging import create_main_logger, create_sub_logger
+from strangefish.utilities.player_logging import create_file_handler, create_stream_handler
 
 
 class OurRemoteGame(RemoteGame):
-    def __init__(self, *args, **kwargs):
-        self.logger = create_sub_logger("game_communications")
-        super().__init__(*args, **kwargs)
+
+    def __init__(self, server_url, game_id, auth):
+        self.logger = logging.getLogger(f"game-{game_id}.server-comms")
+        super().__init__(server_url, game_id, auth)
 
     def is_op_turn(self):
         status = self._get("game_status")
@@ -100,12 +98,13 @@ class OurRemoteGame(RemoteGame):
 
 def our_play_remote_game(server_url, game_id, auth, player: Player):
     game = OurRemoteGame(server_url, game_id, auth)
-    logger = create_sub_logger("game_moderator")
+    logger = logging.getLogger(f"game-{game_id}.game-mod")
 
     op_name = game.get_opponent_name()
     our_color = game.get_player_color()
 
-    logger.debug("Setting up remote game %d playing %s against %s.", game_id, chess.COLOR_NAMES[our_color], op_name)
+    logger.debug("Setting up remote game %d playing %s against %s.",
+                 game_id, chess.COLOR_NAMES[our_color], op_name)
 
     player.handle_game_start(our_color, game.get_starting_board(), op_name)
     game.start()
@@ -115,7 +114,7 @@ def our_play_remote_game(server_url, game_id, auth, player: Player):
         turn_num += 1
         logger.info("Playing turn %2d. (%3.0f seconds left.)", turn_num, game.get_seconds_left())
         play_turn(game, player, end_turn_last=False)
-        logger.info("   Done turn %2d.", turn_num)
+        logger.info("   Done turn %2d. (%d boards.)", turn_num, len(player.boards))
 
         if hasattr(player, "while_we_wait") and getattr(player, "while_we_wait"):
             while game.is_op_turn():
@@ -136,20 +135,20 @@ def accept_invitation_and_play(server_url, auth, invitation_id, finished):
     # make sure this process doesn't react to the first interrupt signal
     signal.signal(signal.SIGINT, ignore_one_term)
 
-    player = StrangeFish2(rc_disable_pbar=True)
-
-    logger = create_sub_logger("invitations")
+    logger = logging.getLogger("rc-connect")
 
     logger.debug("Accepting invitation %d.", invitation_id)
     server = RBCServer(server_url, auth)
     game_id = server.accept_invitation(invitation_id)
     logger.info("Invitation %d accepted. Playing game %d.", invitation_id, game_id)
 
+    player = StrangeFish2(game_id=game_id)
+
     try:
         our_play_remote_game(server_url, game_id, auth, player)
         logger.debug("Finished game %d.", game_id)
     except:
-        logger.error("Fatal error in game %d.", game_id)
+        logging.getLogger(f"game-{game_id}").exception("Fatal error in game %d.", game_id)
         traceback.print_exc()
         server.error_resign(game_id)
         player.handle_game_end(None, None, None)
@@ -160,12 +159,14 @@ def accept_invitation_and_play(server_url, auth, invitation_id, finished):
         logger.debug("Game %d ended. Invitation %d closed.", game_id, invitation_id)
 
 
-def listen_for_invitations(server, max_concurrent_games):
-    logger = create_sub_logger("server_manager")
+def listen_for_invitations(server, max_concurrent_games, limit_games):
+    logger = logging.getLogger("rc-connect")
 
     connected = False
     process_by_invitation = {}
     finished_by_invitation = {}
+    num_games_joined = 0
+    disconnect_signalled = False
     while True:
         try:
             # get unaccepted invitations
@@ -183,10 +184,20 @@ def listen_for_invitations(server, max_concurrent_games):
                 if not process_by_invitation[invitation].is_alive() or finished_by_invitation[invitation].value:
                     finished_invitations.append(invitation)
             for invitation in finished_invitations:
-                logger.info(f"Terminating process for invitation {invitation}")
+                logger.info(f"Terminating process for invitation {invitation}"
+                            f" (exit code: {process_by_invitation[invitation].exitcode})")
                 process_by_invitation[invitation].terminate()
                 del process_by_invitation[invitation]
                 del finished_by_invitation[invitation]
+
+            # Optionally, disconnect after N games joined, and exit the script when all game completed
+            if limit_games is not None and num_games_joined >= limit_games:
+                if not disconnect_signalled:
+                    server.set_max_games(0)
+                    server.set_ranked(False)
+                    disconnect_signalled = True
+                elif not process_by_invitation and not invitations:
+                    return
 
             # accept invitations until we have #max_concurrent_games processes alive
             for invitation in invitations:
@@ -199,21 +210,16 @@ def listen_for_invitations(server, max_concurrent_games):
                         finished = multiprocessing.Value("b", False)
                         process = multiprocessing.Process(
                             target=accept_invitation_and_play,
-                            args=(
-                                server.server_url,
-                                server.session.auth,
-                                invitation,
-                                finished,
-                            ),
-                        )
+                            args=(server.server_url, server.session.auth, invitation, finished))
                         process.start()
+                        num_games_joined += 1
 
                         # store the process so we can check when it finishes
                         process_by_invitation[invitation] = process
                         finished_by_invitation[invitation] = finished
                     else:
                         logger.info(f"Not enough game slots to play invitation {invitation}.")
-                        unranked_mode(server)
+                        server.set_ranked(False)
                         max_concurrent_games += 1
 
         except requests.RequestException as e:
@@ -231,12 +237,25 @@ def listen_for_invitations(server, max_concurrent_games):
 @click.argument("username")
 @click.argument("password")
 @click.option("--server-url", "server_url", default="https://rbc.jhuapl.edu", help="URL of the server.")
-@click.option("--max-concurrent-games", "max_concurrent_games", type=int, default=1, help="Max simultaneous games.")
+@click.option("--max-concurrent-games", "max_concurrent_games", type=int, default=1, help="Maximum games to play at once.")
+@click.option("--limit-games", "limit_games", type=int, default=None, help="Optional limit to number of games played.")
 @click.option("--ranked", "ranked", type=bool, default=False, help="Play for leaderboard ELO.")
 @click.option("--keep-version", "keep_version", type=bool, default=True, help="Keep existing leaderboard version num.")
-def main(username, password, server_url, max_concurrent_games, ranked, keep_version):
-    create_main_logger(log_to_file=True)
-    logger = create_sub_logger("modified_rc_connect")
+def main(username, password, server_url, max_concurrent_games, limit_games, ranked, keep_version):
+
+    logger = logging.getLogger("rc-connect")
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(create_stream_handler())
+    logger.addHandler(create_file_handler(f"rc_connect_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.log"))
+
+    logger.debug(
+        f"Running modified_rc_connect to play RBC games online."
+        f" {server_url=}"
+        f" {max_concurrent_games=}"
+        f" {limit_games=}"
+        f" {ranked=}"
+        f" {keep_version=}"
+    )
 
     auth = username, password
     server = RBCServer(server_url, auth)
@@ -248,18 +267,20 @@ def main(username, password, server_url, max_concurrent_games, ranked, keep_vers
         # reset to default response to interrupt signals
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         logger.warning("Received terminate signal, waiting for games to finish and then exiting.")
-        unranked_mode(server)
+        server.set_ranked(False)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_term)
 
     # tell the server whether we want to do ranked matches or not
     if ranked:
-        ranked_mode(server, keep_version)
+        if not keep_version:
+            server.increment_version()
+        server.set_ranked(True)
     else:
-        unranked_mode(server)
+        server.set_ranked(False)
 
-    listen_for_invitations(server, max_concurrent_games)
+    listen_for_invitations(server, max_concurrent_games, limit_games)
 
 
 if __name__ == "__main__":
